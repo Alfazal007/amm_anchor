@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token_interface::{self, MintTo, TransferChecked};
+use anchor_spl::token_interface::{self, burn_checked, BurnChecked, MintTo, TransferChecked};
 
 declare_id!("Avj3EdWetSP4wZwMG5xCn9zWKCb9cq7EQVd5xVotyJDj");
 
@@ -165,12 +165,49 @@ pub mod amm {
         Ok(())
     }
 
-    pub fn remove_liquidity(ctx: Context<Initialize>) -> Result<()> {
+    pub fn remove_liquidity(ctx: Context<RemoveLiquidity>, amount_of_lp: u64) -> Result<()> {
+        let (token1_to_return, token2_to_return) = tokens_to_return_while_remove_liquidity(
+            amount_of_lp,
+            ctx.accounts.lp_mint.supply,
+            ctx.accounts.token_1_account.amount,
+            ctx.accounts.token_2_account.amount,
+        )?;
+        burn_lp_tokens_from_user(
+            amount_of_lp,
+            ctx.accounts.user_lp_ata.to_account_info(),
+            ctx.accounts.signer.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.lp_mint.to_account_info(),
+            ctx.accounts.lp_mint.decimals,
+        )?;
+        let seeds: &[&[&[u8]]] = &[&[b"pool_authority", &[ctx.bumps.pool_authority]]];
+        transfer_tokens_general_from_pool_to_user(
+            ctx.accounts.mint_token1.to_account_info(),
+            ctx.accounts.token_1_account.to_account_info(),
+            ctx.accounts.token_1_account_of_user.to_account_info(),
+            ctx.accounts.pool_authority.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            token1_to_return,
+            ctx.accounts.mint_token1.decimals,
+            seeds,
+        )?;
+        transfer_tokens_general_from_pool_to_user(
+            ctx.accounts.mint_token2.to_account_info(),
+            ctx.accounts.token_2_account.to_account_info(),
+            ctx.accounts.token_2_account_of_user.to_account_info(),
+            ctx.accounts.pool_authority.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            token2_to_return,
+            ctx.accounts.mint_token2.decimals,
+            seeds,
+        )?;
+        ctx.accounts.data_account.token_1_balance -= token1_to_return;
+        ctx.accounts.data_account.token_2_balance -= token2_to_return;
         Ok(())
     }
 }
 
-fn transfer_tokens_general_from_pool_to_user<'info>(
+pub fn transfer_tokens_general_from_pool_to_user<'info>(
     mint_account: AccountInfo<'info>,
     from: AccountInfo<'info>,
     to: AccountInfo<'info>,
@@ -191,7 +228,7 @@ fn transfer_tokens_general_from_pool_to_user<'info>(
     Ok(())
 }
 
-fn transfer_tokens_general_from_user_to_pool<'info>(
+pub fn transfer_tokens_general_from_user_to_pool<'info>(
     mint_account: AccountInfo<'info>,
     from: AccountInfo<'info>,
     to: AccountInfo<'info>,
@@ -211,7 +248,7 @@ fn transfer_tokens_general_from_user_to_pool<'info>(
     Ok(())
 }
 
-fn mint_lp_tokens<'info>(
+pub fn mint_lp_tokens<'info>(
     lp_token_mint: AccountInfo<'info>,
     to: AccountInfo<'info>,
     authority: AccountInfo<'info>,
@@ -350,4 +387,46 @@ pub fn get_swap_quote(
         tokens_to_remove_from_pool = token1_balance - res;
     }
     Ok(tokens_to_remove_from_pool)
+}
+
+pub fn tokens_to_return_while_remove_liquidity(
+    lp_token_to_burn: u64,
+    total_lp_tokens: u64,
+    token_1_balance_in_pool: u64,
+    token_2_balance_in_pool: u64,
+) -> Result<(u64, u64)> {
+    let token1_return = lp_token_to_burn
+        .checked_mul(token_1_balance_in_pool)
+        .ok_or(GeneralErrors::MathOverflow)?
+        .checked_div(total_lp_tokens)
+        .ok_or(GeneralErrors::MathDivisionByZero)?;
+    let token2_return = lp_token_to_burn
+        .checked_mul(token_2_balance_in_pool)
+        .ok_or(GeneralErrors::MathOverflow)?
+        .checked_div(total_lp_tokens)
+        .ok_or(GeneralErrors::MathDivisionByZero)?;
+    Ok((token1_return, token2_return))
+}
+
+pub fn burn_lp_tokens_from_user<'info>(
+    amount: u64,
+    from: AccountInfo<'info>,
+    authority: AccountInfo<'info>,
+    token_program: AccountInfo<'info>,
+    mint: AccountInfo<'info>,
+    decimals: u8,
+) -> Result<()> {
+    burn_checked(
+        CpiContext::new(
+            token_program,
+            BurnChecked {
+                mint,
+                from,
+                authority,
+            },
+        ),
+        amount,
+        decimals,
+    )?;
+    Ok(())
 }

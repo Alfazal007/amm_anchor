@@ -1,7 +1,7 @@
 import * as anchor from "@coral-xyz/anchor"
 import { Program } from "@coral-xyz/anchor"
 import { Amm } from "../target/types/amm"
-import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, createMint, getAccount, getAssociatedTokenAddress, mintTo } from "@solana/spl-token"
+import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, createMint, getAccount, getAssociatedTokenAddress, getMint, mintTo } from "@solana/spl-token"
 import { assert } from "chai"
 
 describe("amm initialize", () => {
@@ -400,5 +400,80 @@ describe("amm initialize", () => {
         assert.strictEqual(userToken1After, userToken1Before + Number(quotedAmount), "User token1 should increase by quoted amount")
         assert.strictEqual(poolToken1After, poolToken1Before - Number(quotedAmount), "Pool token1 should decrease by quoted amount")
     })
+
+    it("Burns LP tokens and withdraws liquidity correctly for second user", async () => {
+        const token1UserAta = await getAssociatedTokenAddress(mintToken1, payer.publicKey);
+        const token2UserAta = await getAssociatedTokenAddress(mintToken2, payer.publicKey);
+        const userLpAta = await getAssociatedTokenAddress(lpMintPda, payer.publicKey);
+        const [poolAuthorityPda] = await anchor.web3.PublicKey.findProgramAddress(
+            [Buffer.from("pool_authority")],
+            program.programId
+        );
+
+        const poolToken1Ata = await getAssociatedTokenAddress(mintToken1, poolAuthorityPda, true);
+        const poolToken2Ata = await getAssociatedTokenAddress(mintToken2, poolAuthorityPda, true);
+
+        // Fetch balances before burning
+        const userToken1Before = Number((await getAccount(connection, token1UserAta)).amount);
+        const userToken2Before = Number((await getAccount(connection, token2UserAta)).amount);
+        const poolToken1Before = Number((await getAccount(connection, poolToken1Ata)).amount);
+        const poolToken2Before = Number((await getAccount(connection, poolToken2Ata)).amount);
+        const userLpBefore = Number((await getAccount(connection, userLpAta)).amount);
+        const totalLpBefore = Number((await getMint(connection, lpMintPda)).supply);
+
+        // Assert user has LP tokens to burn
+        assert(userLpBefore > 0, "User should have LP tokens before burning");
+
+        // Call removeLiquidity with user's full LP balance
+        await program.methods.removeLiquidity(new anchor.BN(userLpBefore)).accounts({
+            signer: payer.publicKey,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            mintToken1: mintToken1,
+            mintToken2: mintToken2,
+        }).rpc();
+
+        // Fetch balances after burning
+        const userToken1After = Number((await getAccount(connection, token1UserAta)).amount);
+        const userToken2After = Number((await getAccount(connection, token2UserAta)).amount);
+        const poolToken1After = Number((await getAccount(connection, poolToken1Ata)).amount);
+        const poolToken2After = Number((await getAccount(connection, poolToken2Ata)).amount);
+        const userLpAfter = Number((await getAccount(connection, userLpAta)).amount);
+        const totalLpAfter = Number((await getMint(connection, lpMintPda)).supply);
+
+        // Assert user LP tokens burned fully
+        assert.strictEqual(userLpAfter, 0, "User LP tokens should be zero after burning");
+
+        // Assert total LP supply decreased correctly (within small tolerance)
+        const expectedTotalLpAfter = totalLpBefore - userLpBefore;
+        assert.ok(
+            Math.abs(totalLpAfter - expectedTotalLpAfter) <= 5,
+            `Total LP supply after burning should decrease by burned amount. Expected ~${expectedTotalLpAfter}, got ${totalLpAfter}`
+        );
+
+        // Calculate expected token withdrawals proportionally
+        const burnRatio = userLpBefore / totalLpBefore;
+        const expectedUserToken1Increase = Math.floor(poolToken1Before * burnRatio);
+        const expectedUserToken2Increase = Math.floor(poolToken2Before * burnRatio);
+
+        // Check user token balances increased as expected (allow small tolerance)
+        assert.ok(
+            Math.abs(userToken1After - userToken1Before - expectedUserToken1Increase) <= 5,
+            `User token1 balance should increase by ~${expectedUserToken1Increase}`
+        );
+        assert.ok(
+            Math.abs(userToken2After - userToken2Before - expectedUserToken2Increase) <= 5,
+            `User token2 balance should increase by ~${expectedUserToken2Increase}`
+        );
+
+        // Check pool token balances decreased as expected (allow small tolerance)
+        assert.ok(
+            Math.abs(poolToken1Before - poolToken1After - expectedUserToken1Increase) <= 5,
+            `Pool token1 balance should decrease by ~${expectedUserToken1Increase}`
+        );
+        assert.ok(
+            Math.abs(poolToken2Before - poolToken2After - expectedUserToken2Increase) <= 5,
+            `Pool token2 balance should decrease by ~${expectedUserToken2Increase}`
+        );
+    });
 })
 
