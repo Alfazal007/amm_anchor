@@ -91,7 +91,7 @@ pub mod amm {
     }
 
     // token means token you are giving to the pool
-    // amount of another token you want to extract from the pool
+    // amount of tokens to send to amm
     pub fn quote(ctx: Context<QuoteAmm>, token: Pubkey, amount: u64) -> Result<u64> {
         let token1_mint = ctx.accounts.data_account.token_1_mint;
         let token1_balance = ctx.accounts.data_account.token_1_balance;
@@ -100,29 +100,95 @@ pub mod amm {
     }
 
     // amount you want to put into the pool
-    pub fn getToken1SendToken2(ctx: Context<GetToken1>, amount: u64) -> Result<()> {
-        let amount_after_fee = after_fee(amount)?;
+    pub fn swap(
+        ctx: Context<SwapToken>,
+        amount_adding_to_pool: u64,
+        token_putting_to_pool: Pubkey,
+    ) -> Result<()> {
+        let amount_after_fee = after_fee(amount_adding_to_pool)?;
         let token1_balance = ctx.accounts.data_account.token_1_balance;
         let token2_balance = ctx.accounts.data_account.token_2_balance;
         let token1_mint = ctx.accounts.data_account.token_1_mint;
-        let token2_mint = ctx.accounts.data_account.token_2_mint;
-        let quote = get_quote(
+        let amount_to_send_to_user = get_swap_quote(
             token1_balance,
             token2_balance,
             token1_mint,
             amount_after_fee,
-            token2_mint,
-        );
-        // TODO:: get quote
-        // TODO:: put token from user to pool
-        // TODO:: put token from pool to user
-        // TODO:: update the data account
+            token_putting_to_pool,
+        )?;
+        let seeds: &[&[&[u8]]] = &[&[b"pool_authority", &[ctx.bumps.pool_authority]]];
+        if token_putting_to_pool == ctx.accounts.data_account.token_1_mint.key() {
+            transfer_tokens_general_from_user_to_pool(
+                ctx.accounts.mint_token1.to_account_info(),
+                ctx.accounts.token_1_account_of_user.to_account_info(),
+                ctx.accounts.token_1_account.to_account_info(),
+                ctx.accounts.signer.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                amount_adding_to_pool,
+                ctx.accounts.mint_token1.decimals,
+            )?;
+            transfer_tokens_general_from_pool_to_user(
+                ctx.accounts.mint_token2.to_account_info(),
+                ctx.accounts.token_2_account.to_account_info(),
+                ctx.accounts.token_2_account_of_user.to_account_info(),
+                ctx.accounts.pool_authority.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                amount_to_send_to_user,
+                ctx.accounts.mint_token2.decimals,
+                seeds,
+            )?;
+            ctx.accounts.data_account.token_1_balance += amount_adding_to_pool;
+            ctx.accounts.data_account.token_2_balance -= amount_to_send_to_user;
+        } else {
+            transfer_tokens_general_from_user_to_pool(
+                ctx.accounts.mint_token2.to_account_info(),
+                ctx.accounts.token_2_account_of_user.to_account_info(),
+                ctx.accounts.token_2_account.to_account_info(),
+                ctx.accounts.signer.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                amount_adding_to_pool,
+                ctx.accounts.mint_token2.decimals,
+            )?;
+            transfer_tokens_general_from_pool_to_user(
+                ctx.accounts.mint_token1.to_account_info(),
+                ctx.accounts.token_1_account.to_account_info(),
+                ctx.accounts.token_1_account_of_user.to_account_info(),
+                ctx.accounts.pool_authority.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                amount_to_send_to_user,
+                ctx.accounts.mint_token1.decimals,
+                seeds,
+            )?;
+            ctx.accounts.data_account.token_2_balance += amount_adding_to_pool;
+            ctx.accounts.data_account.token_1_balance -= amount_to_send_to_user;
+        }
         Ok(())
     }
 
     pub fn remove_liquidity(ctx: Context<Initialize>) -> Result<()> {
         Ok(())
     }
+}
+
+fn transfer_tokens_general_from_pool_to_user<'info>(
+    mint_account: AccountInfo<'info>,
+    from: AccountInfo<'info>,
+    to: AccountInfo<'info>,
+    authority: AccountInfo<'info>,
+    cpi_program: AccountInfo<'info>,
+    amount: u64,
+    decimals: u8,
+    seeds: &[&[&[u8]]],
+) -> Result<()> {
+    let cpi_accounts = TransferChecked {
+        mint: mint_account,
+        from,
+        to,
+        authority,
+    };
+    let cpi_context = CpiContext::new(cpi_program, cpi_accounts).with_signer(seeds);
+    token_interface::transfer_checked(cpi_context, amount, decimals)?;
+    Ok(())
 }
 
 fn transfer_tokens_general_from_user_to_pool<'info>(
@@ -221,29 +287,67 @@ pub fn get_quote(
     token1_balance: u64,
     token2_balance: u64,
     token1_mint: Pubkey,
-    amount: u64,
-    token: Pubkey,
+    amount_to_put_into_the_pool: u64,
+    token_to_put_into_the_pool: Pubkey,
+) -> Result<u64> {
+    let amount_after_fees = after_fee(amount_to_put_into_the_pool)?;
+    let k = token1_balance
+        .checked_mul(token2_balance)
+        .ok_or(GeneralErrors::MathOverflow)?;
+    let res: u64;
+    let tokens_to_remove_from_pool: u64;
+    if token_to_put_into_the_pool == token1_mint {
+        let new_t1_balance = token1_balance
+            .checked_add(amount_after_fees)
+            .ok_or(GeneralErrors::MathOverflow)?;
+        res = k
+            .checked_div(new_t1_balance)
+            .ok_or(GeneralErrors::MathDivisionByZero)?;
+        require!(token2_balance >= res, GeneralErrors::PoolInsufficient);
+        tokens_to_remove_from_pool = token2_balance - res;
+    } else {
+        let denom = token2_balance
+            .checked_add(amount_after_fees)
+            .ok_or(GeneralErrors::MathUnderflow)?;
+        res = k
+            .checked_div(denom)
+            .ok_or(GeneralErrors::MathDivisionByZero)?;
+        require!(res <= token1_balance, GeneralErrors::PoolInsufficient);
+        tokens_to_remove_from_pool = token1_balance - res;
+    }
+    Ok(tokens_to_remove_from_pool)
+}
+
+pub fn get_swap_quote(
+    token1_balance: u64,
+    token2_balance: u64,
+    token1_mint: Pubkey,
+    amount_to_put_into_the_pool: u64,
+    token_to_put_into_the_pool: Pubkey,
 ) -> Result<u64> {
     let k = token1_balance
         .checked_mul(token2_balance)
         .ok_or(GeneralErrors::MathOverflow)?;
     let res: u64;
-    if token == token1_mint {
-        require!(amount <= token1_balance, GeneralErrors::PoolInsufficient);
-        let denom = token1_balance
-            .checked_sub(amount)
-            .ok_or(GeneralErrors::MathUnderflow)?;
+    let tokens_to_remove_from_pool: u64;
+    if token_to_put_into_the_pool == token1_mint {
+        let new_t1_balance = token1_balance
+            .checked_add(amount_to_put_into_the_pool)
+            .ok_or(GeneralErrors::MathOverflow)?;
         res = k
-            .checked_div(denom)
+            .checked_div(new_t1_balance)
             .ok_or(GeneralErrors::MathDivisionByZero)?;
+        require!(token2_balance >= res, GeneralErrors::PoolInsufficient);
+        tokens_to_remove_from_pool = token2_balance - res;
     } else {
-        require!(amount <= token2_balance, GeneralErrors::PoolInsufficient);
         let denom = token2_balance
-            .checked_sub(amount)
+            .checked_add(amount_to_put_into_the_pool)
             .ok_or(GeneralErrors::MathUnderflow)?;
         res = k
             .checked_div(denom)
             .ok_or(GeneralErrors::MathDivisionByZero)?;
+        require!(res <= token1_balance, GeneralErrors::PoolInsufficient);
+        tokens_to_remove_from_pool = token1_balance - res;
     }
-    Ok(res)
+    Ok(tokens_to_remove_from_pool)
 }
